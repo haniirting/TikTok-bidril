@@ -1,0 +1,110 @@
+import express from 'express';import multer from 'multer';import cors from 'cors';
+import fs from 'fs';import path from 'path';import crypto from 'crypto';
+import {execFile} from 'child_process';import {promisify} from 'util';
+const ex=promisify(execFile),sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const PORT=process.env.PORT||8787,OLLAMA=process.env.OLLAMA_URL||'http://127.0.0.1:11434',MODEL=process.env.OLLAMA_MODEL||'gemma3:4b',ADMIN=process.env.ADMIN_TOKEN||'';
+const DATA=path.resolve('data'),UP=path.join(DATA,'videos'),PEND=path.join(DATA,'pending');
+for(const d of[UP,PEND])fs.mkdirSync(d,{recursive:true});
+const dbf=path.join(DATA,'db.json');
+let db={videos:[],stat:{likes:0,favs:0,shares:0,clips:0,n:0,good:0},Wm:null,prof:null};
+try{Object.assign(db,JSON.parse(fs.readFileSync(dbf,'utf8')))}catch{}
+const save=()=>fs.writeFileSync(dbf,JSON.stringify(db));
+
+/* ---------- SSE ---------- */
+const clients=new Set();
+const send=(ev,d)=>{const s=`event: ${ev}\ndata: ${JSON.stringify(d)}\n\n`;for(const r of clients)r.write(s)};
+
+/* ---------- мозг: импульсная сеть, 176 нейронов (сид фиксирован, чтобы веса сохранялись) ---------- */
+let seed=12345;const rnd=()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296};
+const NS=16,NH=160,NM=6,ACT=['like','fav','share','profile','swipe','record'];
+const Wsh=new Float32Array(NS*NH),Whh=new Float32Array(NH*NH),Wm=db.Wm?Float32Array.from(db.Wm):new Float32Array(NM*NH).map(()=>.1+Math.random()*.25);
+const mv=new Float32Array(NH),sp=new Uint8Array(NS+NH),hr=new Float32Array(NH),x=new Float32Array(8),rows=new Uint8Array(40);
+for(let h=0;h<NH;h++){const inh=rnd()<.2;
+ for(let k=0;k<3;k++)Wsh[((rnd()*NS)|0)*NH+h]=.3+rnd()*.2;
+ for(let k=0;k<11;k++){const j=(rnd()*NH)|0;if(j!==h)Whh[h*NH+j]=inh?-.3:.1}}
+let watching=false,wt=0;
+function tick(){const I=new Float32Array(NH);
+ for(let s=0;s<NS;s++){const f=Math.random()<x[s>>1]*.35?1:0;sp[s]=f;if(f)for(let h=0;h<NH;h++)I[h]+=Wsh[s*NH+h]}
+ for(let i=0;i<NH;i++)if(sp[NS+i]){const r=i*NH;for(let j=0;j<NH;j++)I[j]+=Whh[r+j]}
+ for(let h=0;h<NH;h++){mv[h]=mv[h]*.9+I[h];const f=mv[h]>1;sp[NS+h]=f?1:0;if(f){mv[h]=0;rows[h>>2]=1;if(watching)hr[h]++}}
+ if(watching)wt++}
+setInterval(()=>{for(let i=0;i<6;i++)tick()},16);
+setInterval(()=>{send('brain',Array.from(rows));rows.fill(0)},100);
+
+/* ---------- жизнь мухи ---------- */
+let cur=null,prof=db.prof;
+const DUR={like:1300,fav:1300,share:1300,profile:4100,record:4300,swipe:0};
+const info=(v,c)=>({id:v.id,url:'/videos/'+v.file,au:v.au,cap:v.cap,f:v.f,cur:c});
+function pickNext(){const ok=db.videos.filter(v=>v.status==='approved'&&v!==cur);
+ if(!ok.length)return cur&&cur.status==='approved'?cur:null;
+ if(!prof||Math.random()<.25)return ok[Math.random()*ok.length|0];
+ return ok.map(v=>[v,-v.f.reduce((s,a,i)=>s+(a-prof[i])**2,0)+Math.random()*.1]).sort((a,b)=>b[1]-a[1])[0][0]}
+async function life(){for(;;){
+ if(!cur||cur.status!=='approved'){cur=pickNext();if(!cur){send('idle',{});await sleep(3000);continue}send('video',info(cur,true))}
+ const f=cur.f;x.set([f[0],f[1],f[2],f[3],.5,.5,1-f[0],1-f[3]]);
+ hr.fill(0);wt=0;watching=true;await sleep(2300);watching=false;
+ const S=db.stat,eps=Math.max(.08,.35*Math.pow(.97,Math.min(S.n,200)));let m=0;
+ if(Math.random()<eps)m=Math.random()*NM|0;else{let best=-1;for(let q=0;q<NM;q++){let s=0;for(let h=0;h<NH;h++)s+=hr[h]*Wm[q*NH+h];if(s>best){best=s;m=q}}}
+ const a=ACT[m],ap=.5*f[0]+.5*f[3],r=a==='swipe'?(.45-ap)*2.2:a==='profile'?(.5-ap)*.6:a==='record'?ap-.6:(ap-.45)*2.2;
+ for(let h=0;h<NH;h++)Wm[m*NH+h]=Math.min(2,Math.max(0,Wm[m*NH+h]+.5*r*hr[h]/Math.max(1,wt)));
+ S.n++;if(r>0)S.good++;if(a==='like')S.likes++;if(a==='fav')S.favs++;if(a==='share')S.shares++;if(a==='record')S.clips++;
+ if(r>0&&['like','fav','share'].includes(a))prof=prof?prof.map((p,i)=>p*.8+f[i]*.2):f.slice();
+ db.Wm=Array.from(Wm);db.prof=prof;save();
+ send('act',{a,r,note:ap>.55?'живое видео':ap<.35?'скучное видео':'так себе видео'});
+ await sleep(DUR[a]);
+ const nx=pickNext();if(nx){send('video',info(nx,false));cur=nx}
+ await sleep(2000)}}
+
+/* ---------- ffmpeg: признаки видео для мозга ---------- */
+async function features(p){
+ const {stdout}=await ex('ffmpeg',['-v','error','-i',p,'-t','20','-vf','fps=10,scale=16:28,format=gray','-f','rawvideo','-'],{encoding:'buffer',maxBuffer:64e6});
+ const n=Math.floor(stdout.length/448);if(n<2)return[.3,.5,.5,.1];
+ let L=0,mo=0,fl=0,sd=0,pL=0,prev=null;
+ for(let k=0;k<n;k++){const fr=stdout.subarray(k*448,(k+1)*448);let s=0,q=0,df=0;
+  for(let i=0;i<448;i++){s+=fr[i];q+=fr[i]*fr[i];if(prev)df+=Math.abs(fr[i]-prev[i])}
+  const l=s/448;L+=l;sd+=Math.sqrt(Math.max(0,q/448-l*l));if(prev){mo+=df/448;fl+=Math.abs(l-pL)}pL=l;prev=Buffer.from(fr)}
+ const cl=v=>Math.min(1,Math.max(0,v));
+ return[cl(mo/(n-1)/25),cl(L/n/255),cl(sd/n/64),cl(fl/(n-1)/10)]}
+
+/* ---------- модерация через Ollama ---------- */
+const PROMPT='Ты модератор публичной ленты коротких видео. Перед тобой кадры из одного ролика. Ответь только JSON: {"safe":true|false,"reason":"коротко по-русски"}. safe=false, если есть: сексуальный контент или обнажёнка, насилие, кровь, жестокость к животным, дети в небезопасном или неуместном контексте, оружие в угрожающем виде, наркотики, ненависть и экстремистская символика, документы или личные данные, чужая переписка на экране. Если сомневаешься: safe=false.';
+async function moderate(v){const src=path.join(PEND,v.file);
+ try{const dur=parseFloat((await ex('ffprobe',['-v','error','-show_entries','format=duration','-of','csv=p=0',src])).stdout);
+  if(!(dur>0)||dur>60)throw new Error('длина должна быть до 60 секунд');
+  const tmp=fs.mkdtempSync(path.join(DATA,'f-'));
+  await ex('ffmpeg',['-v','error','-i',src,'-vf',`fps=${(5/dur).toFixed(4)},scale=384:-2`,'-frames:v','5',path.join(tmp,'%d.jpg')]);
+  const imgs=fs.readdirSync(tmp).sort().map(f=>fs.readFileSync(path.join(tmp,f)).toString('base64'));fs.rmSync(tmp,{recursive:true});
+  if(!imgs.length)throw new Error('нет кадров');
+  const r=await fetch(OLLAMA+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:MODEL,stream:false,format:'json',messages:[{role:'user',content:PROMPT,images:imgs}]})});
+  const j=JSON.parse((await r.json()).message.content);
+  if(j.safe===true){v.f=await features(src);fs.renameSync(src,path.join(UP,v.file));v.status='approved'}
+  else{v.status='rejected';v.reason=String(j.reason||'').slice(0,120)}
+ }catch(e){v.status='error';v.reason=String(e.message||e).slice(0,120)}
+ if(v.status!=='approved')fs.rm(src,()=>{});save()}
+
+/* ---------- HTTP ---------- */
+const app=express();app.set('trust proxy',true);app.use(cors({origin:process.env.ALLOW_ORIGIN||'*'}));
+const EXT={'video/mp4':'mp4','video/webm':'webm','video/quicktime':'mov'};
+const up=multer({storage:multer.diskStorage({destination:PEND,filename:(q,f,cb)=>cb(null,crypto.randomUUID()+'.'+EXT[f.mimetype])}),limits:{fileSize:30e6,files:1},fileFilter:(q,f,cb)=>cb(null,!!EXT[f.mimetype])});
+const hits=new Map();
+app.post('/api/upload',(req,res)=>{
+ const t=Date.now(),h=(hits.get(req.ip)||[]).filter(a=>t-a<36e5);
+ if(h.length>=5)return res.status(429).json({error:'Не больше 5 видео в час'});
+ up.single('video')(req,res,err=>{
+  if(err||!req.file)return res.status(400).json({error:'Нужен mp4, webm или mov до 30 МБ'});
+  h.push(t);hits.set(req.ip,h);const id=req.file.filename.split('.')[0];
+  const v={id,file:req.file.filename,status:'pending',au:'@гость_'+id.slice(0,4),cap:(req.file.originalname||'ролик').replace(/\.[^.]+$/,'').slice(0,28),f:null,ts:t};
+  db.videos.push(v);save();moderate(v);res.json({id})})});
+app.get('/api/status/:id',(q,r)=>{const v=db.videos.find(a=>a.id===q.params.id);r.json(v?{status:v.status,reason:v.reason}:{status:'error'})});
+app.delete('/api/video/:id',(q,r)=>{
+ if(!ADMIN||q.get('x-admin-token')!==ADMIN)return r.sendStatus(403);
+ const v=db.videos.find(a=>a.id===q.params.id);if(v){v.status='removed';fs.rm(path.join(UP,v.file),()=>{});save()}r.sendStatus(204)});
+app.use('/videos',express.static(UP,{setHeaders:r=>r.set('X-Content-Type-Options','nosniff')}));
+app.get('/api/stream',(q,r)=>{
+ r.set({'Content-Type':'text/event-stream','Cache-Control':'no-cache',Connection:'keep-alive'});r.flushHeaders();clients.add(r);
+ if(cur)r.write(`event: video\ndata: ${JSON.stringify(info(cur,true))}\n\n`);
+ q.on('close',()=>clients.delete(r))});
+setInterval(()=>send('stat',{...db.stat,viewers:clients.size}),2000);
+app.listen(PORT,()=>console.log('Муха слушает порт '+PORT+', модерация: '+MODEL));
+db.videos.filter(v=>v.status==='pending').forEach(moderate);
+life();
